@@ -1,0 +1,17 @@
+[Unit]
+Description=Virtual Multi-User FTP to Telegram Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+WorkingDirectory=/opt/ftp2tg
+EnvironmentFile=/opt/ftp2tg/.env
+ExecStart=/usr/bin/python3 /opt/ftp2tg/ftp2tg_server.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
