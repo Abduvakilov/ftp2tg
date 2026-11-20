@@ -1,3 +1,4 @@
+import hashlib
 import asyncio
 import hmac
 import logging
@@ -108,7 +109,7 @@ def init_db():
         if ADMIN_PASSWORD:
             cur.execute(
                 "INSERT OR IGNORE INTO users (username, password, tg_chat_id) VALUES ('admin', ?, 39707325)",
-                (ADMIN_PASSWORD,),
+                (encode_password(ADMIN_PASSWORD),),
             )
         conn.commit()
     logging.info("Database initialized at %s", DB_PATH)
@@ -128,6 +129,8 @@ def get_user_by_chat_id(chat_id: int):
             (chat_id, chat_id),
         ).fetchone()
 
+def encode_password(password: str) -> str:
+    return hashlib.md5(password.encode("utf-8")).hexdigest()
 
 def schedule_file(file_path: str, tg_chat_id: int, is_incomplete: int) -> int:
     now = datetime.now(timezone.utc).isoformat()
@@ -155,7 +158,7 @@ class SQLiteAuthorizer:
             raise AuthenticationFailed("Invalid username or password.")
         if user["is_stopped"]:
             raise AuthenticationFailed("Account is paused. Send /resume in Telegram.")
-        if not hmac.compare_digest(str(user["password"]), str(password)):
+        if not hmac.compare_digest(str(user["password"]), encode_password(str(password))):
             raise AuthenticationFailed("Invalid username or password.")
 
     def get_home_dir(self, username):
