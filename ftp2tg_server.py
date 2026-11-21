@@ -16,7 +16,7 @@ from pyftpdlib.handlers import FTPHandler
 from pyftpdlib.servers import FTPServer
 from telethon import TelegramClient, events
 from telethon.errors import (
-    ChatMigratedError,
+    ChatWriteForbiddenError,
     FloodWaitError,
     InputUserDeactivatedError,
     UserIsBlockedError,
@@ -346,7 +346,7 @@ async def process_job(worker_id: int, client: TelegramClient, job: dict):
         cleanup_queued_file(str(file_path))
         logging.info("[Worker %d] Sent #%d: %s", worker_id, row_id, file_path.name)
 
-    except ChatMigratedError as e:
+    except ChatWriteForbiddenError as e:
         new_id = e.new_chat_id
         logging.info("[Worker %d] Chat %d migrated to %d", worker_id, target_chat, new_id)
         with get_db() as conn:
