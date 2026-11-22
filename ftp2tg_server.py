@@ -1,615 +1,547 @@
-import hashlib
+#!/usr/bin/env python3
+"""Virtual Multi-User FTP to Telegram Server (MTProto / 2 GB limit)."""
+
 import asyncio
-import hmac
 import logging
 import os
-import secrets
-import shutil
+import re
 import sqlite3
 import threading
-import uuid
-from datetime import datetime, timezone
 from pathlib import Path
 
-from pyftpdlib.authorizers import AuthenticationFailed
+from pyftpdlib.authorizers import AuthenticationFailed, DummyAuthorizer
 from pyftpdlib.handlers import FTPHandler
 from pyftpdlib.servers import FTPServer
-from telethon import TelegramClient, events
-from telethon.errors import (
-    ChatWriteForbiddenError,
-    FloodWaitError,
-    InputUserDeactivatedError,
-    UserIsBlockedError,
-)
+from telethon import TelegramClient, events, utils
+from telethon.errors import ChatWriteForbiddenError, FloodWaitError
+from telethon.tl.functions.channels import GetFullChannelRequest
+from telethon.tl.types import MessageActionChannelMigrateFrom, PeerChat
 
-env_file = Path(__file__).resolve().parent / ".env"
-if env_file.exists():
-    for line in env_file.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if line and not line.startswith("#") and "=" in line:
-            k, v = line.split("=", 1)
-            os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
-
-# --- Configuration (from environment variables) ---
-API_ID = int(os.environ["TG_API_ID"])
-API_HASH = os.environ["TG_API_HASH"]
-BOT_TOKEN = os.environ["TG_BOT_TOKEN"]
-PUBLIC_IP = os.environ["PUBLIC_IP"]
-ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
-
-DB_PATH = Path(os.environ.get("DB_PATH", "/opt/ftp2tg/ftp2tg.db"))
-SESSION_PATH = Path(os.environ.get("SESSION_PATH", "/opt/ftp2tg/bot_session"))
-SPOOL_DIR = Path(os.environ.get("SPOOL_DIR", "/var/spool/ftp2tg"))
-FTP_PORT = int(os.environ.get("FTP_PORT", "2121"))
-PASSIVE_PORT_START = int(os.environ.get("PASSIVE_PORT_START", "60000"))
-PASSIVE_PORT_END = int(os.environ.get("PASSIVE_PORT_END", "60050"))
-
-CONCURRENT_UPLOADS = 2
-DELAY_BETWEEN_FILES = 1.5
-MAX_RETRIES = 3
-MAX_FILE_SIZE_BYTES = 2000 * 1024 * 1024  # 2000 MiB Telegram MTProto limit
-
-INCOMING_DIR = SPOOL_DIR / "incoming"
-QUEUE_DIR = SPOOL_DIR / "queue"
-for d in (INCOMING_DIR, QUEUE_DIR, DB_PATH.parent):
-    d.mkdir(parents=True, exist_ok=True)
-
+# ---------------------------------------------------------------------------
+# Logging & Environment Setup
+# ---------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
+logger = logging.getLogger("ftp2tg")
 
-# Shared async state between FTP thread and Telethon loop
-tg_loop = asyncio.new_event_loop()
-wake_event: asyncio.Event | None = None
-tg_ready = threading.Event()
-in_flight_ids: set[int] = set()
+BASE_DIR = Path(__file__).resolve().parent
 
 
-# --- Database Helpers ---
+def load_env(env_path: Path) -> None:
+    """Load key=value pairs from .env without requiring python-dotenv."""
+    if not env_path.exists():
+        return
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        os.environ.setdefault(key, value)
+
+
+load_env(BASE_DIR / ".env")
+
+
+def env_any(*keys: str, default: str = "") -> str:
+    for key in keys:
+        val = os.getenv(key)
+        if val:
+            return val
+    return default
+
+
+API_ID = int(env_any("API_ID", "TG_API_ID", default="0"))
+API_HASH = env_any("API_HASH", "TG_API_HASH")
+BOT_TOKEN = env_any("BOT_TOKEN", "TG_BOT_TOKEN")
+
+DB_PATH = env_any("DB_PATH", default="/home/opc/main.db")
+SPOOL_DIR = Path(env_any("SPOOL_DIR", default=str(BASE_DIR / "spool")))
+SESSION_PATH = env_any("SESSION_PATH", default=str(BASE_DIR / "ftp2tg_bot"))
+
+FTP_HOST = env_any("FTP_HOST", default="0.0.0.0")
+FTP_PORT = int(env_any("FTP_PORT", default="21"))
+PUBLIC_IP = env_any("PUBLIC_IP", "FTP_PUBLIC_IP", default="")
+PASSIVE_START = int(env_any("PASSIVE_PORT_START", default="60000"))
+PASSIVE_END = int(env_any("PASSIVE_PORT_END", default="60050"))
+
+SPOOL_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# SQLite Database (WAL Mode)
+# ---------------------------------------------------------------------------
 def get_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(str(DB_PATH), timeout=30.0)
+    conn = sqlite3.connect(DB_PATH, timeout=30.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA busy_timeout=10000;")
+    conn.execute("PRAGMA busy_timeout=30000;")
     return conn
 
 
-def init_db():
+def init_db() -> None:
     with get_db() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            """CREATE TABLE IF NOT EXISTS users
-               (id INTEGER PRIMARY KEY AUTOINCREMENT,
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tg_chat_id INTEGER UNIQUE NOT NULL,
+                tg_migrated_chat_id INTEGER,
                 username TEXT UNIQUE NOT NULL,
                 password TEXT NOT NULL,
-                tg_chat_id INTEGER UNIQUE NOT NULL,
-                tg_user_id INTEGER,
-                group_chats_enabled BOOLEAN CHECK (group_chats_enabled IN (0,1)) DEFAULT 0,
-                setting_send_file_name BOOLEAN CHECK (setting_send_file_name IN (0,1)) DEFAULT 0,
-                is_stopped BOOLEAN CHECK (is_stopped IN (0,1)) DEFAULT 0,
-                tg_migrated_chat_id INTEGER
-               );"""
-        )
-        cur.execute(
-            """CREATE TABLE IF NOT EXISTS file_send_schedule
-               (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                time_received timestamp NOT NULL,
-                file_path TEXT NOT NULL,
-                tg_chat_id INTEGER NOT NULL,
-                is_incomplete BOOLEAN CHECK (is_incomplete IN (0,1)),
-                time_sent timestamp
-               );"""
-        )
-
-        # Safe non-destructive migrations for existing databases
-        for alter_sql in (
-            "ALTER TABLE users ADD COLUMN tg_migrated_chat_id INTEGER;",
-            "ALTER TABLE file_send_schedule ADD COLUMN retries INTEGER DEFAULT 0;",
-            "ALTER TABLE file_send_schedule ADD COLUMN failed BOOLEAN DEFAULT 0;",
-        ):
-            try:
-                cur.execute(alter_sql)
-            except sqlite3.OperationalError:
-                pass  # Column already exists
-
-        # Ensure admin row exists if ADMIN_PASSWORD is provided and table has no admin
-        if ADMIN_PASSWORD:
-            cur.execute(
-                "INSERT OR IGNORE INTO users (username, password, tg_chat_id) VALUES ('admin', ?, 39707325)",
-                (encode_password(ADMIN_PASSWORD),),
+                send_filename INTEGER DEFAULT 1,
+                stopped INTEGER DEFAULT 0
             )
-        conn.commit()
-    logging.info("Database initialized at %s", DB_PATH)
-
-
-def get_user_by_username(username: str):
-    with get_db() as conn:
-        return conn.execute(
-            "SELECT * FROM users WHERE username = ?", (username,)
-        ).fetchone()
-
-
-def get_user_by_chat_id(chat_id: int):
-    with get_db() as conn:
-        return conn.execute(
-            "SELECT * FROM users WHERE tg_chat_id = ? OR tg_migrated_chat_id = ?",
-            (chat_id, chat_id),
-        ).fetchone()
-
-def encode_password(password: str) -> str:
-    return hashlib.md5(password.encode("utf-8")).hexdigest()
-
-def schedule_file(file_path: str, tg_chat_id: int, is_incomplete: int) -> int:
-    now = datetime.now(timezone.utc).isoformat()
-    with get_db() as conn:
-        cur = conn.execute(
-            """INSERT INTO file_send_schedule
-               (time_received, file_path, tg_chat_id, is_incomplete, time_sent, retries, failed)
-               VALUES (?, ?, ?, ?, NULL, 0, 0)""",
-            (now, file_path, tg_chat_id, is_incomplete),
+            """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS file_send_schedule (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tg_chat_id INTEGER NOT NULL,
+                file_path TEXT NOT NULL,
+                filename TEXT NOT NULL,
+                send_filename INTEGER DEFAULT 1,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        # Ensure optional columns exist on older databases
+        cols = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(users)").fetchall()
+        }
+        if "tg_migrated_chat_id" not in cols:
+            conn.execute("ALTER TABLE users ADD COLUMN tg_migrated_chat_id INTEGER")
+        if "send_filename" not in cols:
+            conn.execute("ALTER TABLE users ADD COLUMN send_filename INTEGER DEFAULT 1")
+        if "stopped" not in cols:
+            conn.execute("ALTER TABLE users ADD COLUMN stopped INTEGER DEFAULT 0")
         conn.commit()
-        return cur.lastrowid
+    logger.info("Database initialized at %s", DB_PATH)
 
 
-def trigger_workers():
-    if wake_event is not None:
-        tg_loop.call_soon_threadsafe(wake_event.set)
+def safe_user_dir(username: str) -> Path:
+    """Return an isolated per-user directory inside SPOOL_DIR."""
+    safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", username)
+    user_dir = (SPOOL_DIR / safe_name).resolve()
+    if SPOOL_DIR.resolve() not in user_dir.parents:
+        raise ValueError("Invalid username path")
+    user_dir.mkdir(parents=True, exist_ok=True)
+    return user_dir
 
 
-# --- Custom SQLite FTP Authorizer ---
-class SQLiteAuthorizer:
+# ---------------------------------------------------------------------------
+# FTP Server (pyftpdlib)
+# ---------------------------------------------------------------------------
+class SQLiteAuthorizer(DummyAuthorizer):
+    """Authenticates FTP users against SQLite and jails each to their own folder."""
+
+    def __init__(self):
+        super().__init__()
+        self._lock = threading.Lock()
+
     def validate_authentication(self, username, password, handler):
-        user = get_user_by_username(username)
-        if not user:
-            raise AuthenticationFailed("Invalid username or password.")
-        if user["is_stopped"]:
-            raise AuthenticationFailed("Account is paused. Send /resume in Telegram.")
-        if not hmac.compare_digest(str(user["password"]), encode_password(str(password))):
+        with get_db() as conn:
+            user = conn.execute(
+                "SELECT * FROM users WHERE username = ?",
+                (username,),
+            ).fetchone()
+
+        if not user or user["password"] != password:
             raise AuthenticationFailed("Invalid username or password.")
 
-    def get_home_dir(self, username):
-        user = get_user_by_username(username)
-        user_dir = INCOMING_DIR / str(user["id"])
-        user_dir.mkdir(parents=True, exist_ok=True)
-        return str(user_dir)
+        home_dir = str(safe_user_dir(username))
+        with self._lock:
+            self.user_table[username] = {
+                "pwd": password,
+                "home": home_dir,
+                "perm": "elradfmwMT",
+                "operms": {},
+                "msg_login": "Login successful.",
+                "msg_quit": "Goodbye.",
+            }
 
     def has_user(self, username):
-        return get_user_by_username(username) is not None
-
-    def has_perm(self, username, perm, path=None):
-        # e=cwd, l=list, w=write/upload, m=mkdir (useful for cameras creating date folders)
-        return perm in "elwm"
-
-    def get_perms(self, username):
-        return "elwm"
-
-    def get_msg_login(self, username):
-        return "Connected to Virtual Telegram FTP."
-
-    def get_msg_quit(self, username):
-        return "Goodbye."
-
-    def impersonate_user(self, username, password):
-        pass
-
-    def terminate_impersonation(self, username):
-        pass
-
-
-# --- Custom FTP Handler ---
-class MultiUserTelegramFTPHandler(FTPHandler):
-    def _target_chat_id(self):
-        user = get_user_by_username(self.username)
-        if not user:
-            return None
-        return user["tg_migrated_chat_id"] or user["tg_chat_id"]
-
-    def on_file_received(self, file_path):
-        src = Path(file_path)
-        chat_id = self._target_chat_id()
-        if chat_id is None:
-            src.unlink(missing_ok=True)
-            return
-
-        # Move to unique spool folder to preserve exact original filename
-        job_dir = QUEUE_DIR / str(uuid.uuid4())
-        job_dir.mkdir(parents=True, exist_ok=True)
-        dest = job_dir / src.name
-        shutil.move(str(src), str(dest))
-
-        row_id = schedule_file(str(dest), chat_id, is_incomplete=0)
-        logging.info("[FTP] Queued #%d (%s) for chat %d", row_id, src.name, chat_id)
-        trigger_workers()
-
-    def on_incomplete_file_received(self, file_path):
-        src = Path(file_path)
-        filename = src.name
-        chat_id = self._target_chat_id()
-
-        # Remove partial file so disk doesn't fill up, but log it in SQLite
-        src.unlink(missing_ok=True)
-        if chat_id is not None:
-            row_id = schedule_file(filename, chat_id, is_incomplete=1)
-            logging.warning(
-                "[FTP] Incomplete transfer #%d (%s) for chat %d",
-                row_id,
-                filename,
-                chat_id,
-            )
-            trigger_workers()
-
-
-# --- Telethon Upload Worker & Bot Commands ---
-def fetch_next_job():
-    with get_db() as conn:
-        rows = conn.execute(
-            """SELECT * FROM file_send_schedule
-               WHERE time_sent IS NULL AND COALESCE(failed, 0) = 0
-               ORDER BY id ASC LIMIT 20"""
-        ).fetchall()
-        for row in rows:
-            if row["id"] not in in_flight_ids:
-                in_flight_ids.add(row["id"])
-                return dict(row)
-    return None
-
-
-def mark_sent(row_id: int):
-    now = datetime.now(timezone.utc).isoformat()
-    with get_db() as conn:
-        conn.execute(
-            "UPDATE file_send_schedule SET time_sent = ? WHERE id = ?",
-            (now, row_id),
-        )
-        conn.commit()
-
-
-def mark_retry_or_fail(row_id: int, retries: int):
-    failed = 1 if retries >= MAX_RETRIES else 0
-    with get_db() as conn:
-        conn.execute(
-            "UPDATE file_send_schedule SET retries = ?, failed = ? WHERE id = ?",
-            (retries, failed, row_id),
-        )
-        conn.commit()
-    return failed == 1
-
-
-def cleanup_queued_file(file_path_str: str):
-    p = Path(file_path_str)
-    if p.exists():
-        p.unlink(missing_ok=True)
-    # Remove the UUID parent directory if it's inside QUEUE_DIR
-    if p.parent.parent == QUEUE_DIR:
-        shutil.rmtree(p.parent, ignore_errors=True)
-
-
-async def process_job(worker_id: int, client: TelegramClient, job: dict):
-    row_id = job["id"]
-    chat_id = job["tg_chat_id"]
-    user = get_user_by_chat_id(chat_id)
-    target_chat = (
-        (user["tg_migrated_chat_id"] or user["tg_chat_id"]) if user else chat_id
-    )
-
-    try:
-        # Case 1: Incomplete FTP upload -> notify user and mark handled
-        if job["is_incomplete"]:
-            filename = Path(job["file_path"]).name
-            await client.send_message(
-                target_chat,
-                f"⚠️ Incomplete FTP upload detected: `{filename}`.\n"
-                "The transfer dropped before finishing and was not saved. Please re-upload.",
-            )
-            mark_sent(row_id)
-            logging.info("[Worker %d] Notified chat %d of incomplete file %s", worker_id, target_chat, filename)
-            return
-
-        # Case 2: Normal file upload
-        file_path = Path(job["file_path"])
-        if not file_path.exists():
-            logging.warning("[Worker %d] Missing file for job #%d: %s", worker_id, row_id, file_path)
-            mark_retry_or_fail(row_id, MAX_RETRIES)
-            return
-
-        file_size = file_path.stat().st_size
-        if file_size > MAX_FILE_SIZE_BYTES:
-            size_gb = file_size / (1024 ** 3)
-            await client.send_message(
-                target_chat,
-                f"❌ `{file_path.name}` ({size_gb:.2f} GB) exceeds Telegram's 2 GB file limit and could not be sent.",
-            )
-            mark_retry_or_fail(row_id, MAX_RETRIES)
-            cleanup_queued_file(str(file_path))
-            return
-
-        send_name = bool(user["setting_send_file_name"]) if user else False
-        caption = file_path.name if send_name else ""
-
-        logging.info(
-            "[Worker %d] Uploading #%d: %s (%.1f MB) -> %d",
-            worker_id,
-            row_id,
-            file_path.name,
-            file_size / (1024 * 1024),
-            target_chat,
-        )
-        await client.send_file(
-            target_chat,
-            str(file_path),
-            caption=caption,
-            force_document=True,
-        )
-        mark_sent(row_id)
-        cleanup_queued_file(str(file_path))
-        logging.info("[Worker %d] Sent #%d: %s", worker_id, row_id, file_path.name)
-
-    except ChatWriteForbiddenError as e:
-        new_id = e.new_chat_id
-        logging.info("[Worker %d] Chat %d migrated to %d", worker_id, target_chat, new_id)
+        if username in self.user_table:
+            return True
         with get_db() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM users WHERE username = ?", (username,)
+            ).fetchone()
+        return row is not None
+
+
+class TelegramFTPHandler(FTPHandler):
+    """Queues every completed FTP upload for the Telethon upload worker."""
+
+    def on_file_received(self, file: str):
+        username = self.username
+        file_path = Path(file)
+        filename = file_path.name
+
+        with get_db() as conn:
+            user = conn.execute(
+                "SELECT * FROM users WHERE username = ?",
+                (username,),
+            ).fetchone()
+
+            if not user:
+                logger.warning("[FTP] Upload from unknown user '%s', deleting %s", username, file)
+                file_path.unlink(missing_ok=True)
+                return
+
+            if user["stopped"]:
+                logger.info("[FTP] Delivery paused for '%s'; dropping %s", username, filename)
+                file_path.unlink(missing_ok=True)
+                return
+
+            target_chat = user["tg_migrated_chat_id"] or user["tg_chat_id"]
+            send_filename = user["send_filename"]
+
             conn.execute(
-                "UPDATE users SET tg_migrated_chat_id = ? WHERE tg_chat_id = ?",
-                (new_id, chat_id),
-            )
-            conn.execute(
-                "UPDATE file_send_schedule SET tg_chat_id = ? WHERE id = ?",
-                (new_id, row_id),
+                """
+                INSERT INTO file_send_schedule (tg_chat_id, file_path, filename, send_filename)
+                VALUES (?, ?, ?, ?)
+                """,
+                (target_chat, str(file_path), filename, send_filename),
             )
             conn.commit()
-        trigger_workers()
 
-    except (UserIsBlockedError, InputUserDeactivatedError):
-        logging.warning("[Worker %d] User %d blocked bot; marking is_stopped=1", worker_id, target_chat)
-        with get_db() as conn:
-            conn.execute(
-                "UPDATE users SET is_stopped = 1 WHERE tg_chat_id = ? OR tg_migrated_chat_id = ?",
-                (target_chat, target_chat),
-            )
-            conn.commit()
-        mark_retry_or_fail(row_id, MAX_RETRIES)
-        if not job["is_incomplete"]:
-            cleanup_queued_file(job["file_path"])
-
-    except FloodWaitError as e:
-        wait_sec = e.seconds + 2
-        logging.warning("[Worker %d] FloodWait: sleeping %ds", worker_id, wait_sec)
-        await asyncio.sleep(wait_sec)
-        trigger_workers()
-
-    except Exception as e:
-        retries = (job.get("retries") or 0) + 1
-        permanently_failed = mark_retry_or_fail(row_id, retries)
-        logging.error(
-            "[Worker %d] Error on #%d (attempt %d/%d): %s",
-            worker_id,
-            row_id,
-            retries,
-            MAX_RETRIES,
-            e,
-        )
-        if permanently_failed and not job["is_incomplete"]:
-            cleanup_queued_file(job["file_path"])
-        await asyncio.sleep(5 * retries)
-        trigger_workers()
-
-    finally:
-        in_flight_ids.discard(row_id)
+        logger.info("[FTP] Queued '%s' from '%s' -> chat %s", filename, username, target_chat)
 
 
-async def worker_loop(worker_id: int, client: TelegramClient):
-    while True:
-        job = fetch_next_job()
-        if job is None:
-            wake_event.clear()
-            try:
-                await asyncio.wait_for(wake_event.wait(), timeout=15.0)
-            except asyncio.TimeoutError:
-                pass
-            continue
+def start_ftp_server() -> None:
+    authorizer = SQLiteAuthorizer()
+    handler = TelegramFTPHandler
+    handler.authorizer = authorizer
+    if PUBLIC_IP:
+        handler.masquerade_address = PUBLIC_IP
+    handler.passive_ports = range(PASSIVE_START, PASSIVE_END + 1)
 
-        await process_job(worker_id, client, job)
-        await asyncio.sleep(DELAY_BETWEEN_FILES)
+    server = FTPServer((FTP_HOST, FTP_PORT), handler)
+    server.max_cons = 128
+    server.max_cons_per_ip = 16
 
-
-def format_account_details(username: str) -> str:
-    return (
-        f"FTP Server:   `{PUBLIC_IP}`\n"
-        f"Port:               `{FTP_PORT}`\n"
-        f"Username:    `{username}`\n"
-        f"Password:     _(the one you provided)_\n"
-        f"Upload\n"
-        f"Directory:      `/` or any"
-    )
-
-
-def register_bot_commands(client: TelegramClient):
-    @client.on(events.NewMessage(pattern=r"^/start$"))
-    async def cmd_start(event):
-        await event.respond(
-            "Use /create command to create an FTP account\n"
-            "Use /password command to change FTP account password\n"
-            "Use /account command to see FTP account details\n\n"
-            "Other commands: /status | /filename | /stop | /resume"
-        )
-
-    @client.on(events.NewMessage(pattern=r"^/create$"))
-    async def cmd_create(event):
-        chat_id = event.chat_id
-        if get_user_by_chat_id(chat_id):
-            await event.respond(
-                "You already have an FTP account. Use /account to view details or /password to change your password."
-            )
-            return
-
-        sender = await event.get_sender()
-        tg_user_id = sender.id if sender else None
-
-        try:
-            async with client.conversation(chat_id, timeout=120) as conv:
-                await conv.send_message("Send the **username** you want to use:")
-                u_msg = await conv.get_response()
-                username = u_msg.raw_text.strip()
-
-                if not username or " " in username:
-                    await conv.send_message("Invalid username (no spaces allowed). Run /create to try again.")
-                    return
-                if get_user_by_username(username):
-                    await conv.send_message("That username is already taken. Run /create to try another.")
-                    return
-
-                await conv.send_message("Send the **password** for your FTP account:")
-                p_msg = await conv.get_response()
-                password = p_msg.raw_text.strip()
-
-                if not password:
-                    await conv.send_message("Password cannot be empty. Run /create to try again.")
-                    return
-
-                with get_db() as conn:
-                    conn.execute(
-                        """INSERT INTO users (username, password, tg_chat_id, tg_user_id)
-                           VALUES (?, ?, ?, ?)""",
-                        (username, encode_password(password), chat_id, tg_user_id),
-                    )
-                    conn.commit()
-
-                await conv.send_message(
-                    f"FTP account created!\n\n{format_account_details(username)}"
-                )
-        except asyncio.TimeoutError:
-            await event.respond("Timed out. Send /create whenever you're ready to try again.")
-
-    @client.on(events.NewMessage(pattern=r"^/password$"))
-    async def cmd_password(event):
-        chat_id = event.chat_id
-        user = get_user_by_chat_id(chat_id)
-        if not user:
-            await event.respond("You don't have an FTP account yet. Use /create first.")
-            return
-
-        try:
-            async with client.conversation(chat_id, timeout=120) as conv:
-                await conv.send_message("Send your **new password**:")
-                p_msg = await conv.get_response()
-                new_password = p_msg.raw_text.strip()
-
-                if not new_password:
-                    await conv.send_message("Password cannot be empty. Run /password to try again.")
-                    return
-
-                with get_db() as conn:
-                    conn.execute(
-                        "UPDATE users SET password = ? WHERE id = ?",
-                        (encode_password(new_password), user["id"]),
-                    )
-                    conn.commit()
-
-                await conv.send_message("FTP password updated successfully.")
-        except asyncio.TimeoutError:
-            await event.respond("Timed out. Send /password to try again.")
-
-    @client.on(events.NewMessage(pattern=r"^/account$"))
-    async def cmd_account(event):
-        user = get_user_by_chat_id(event.chat_id)
-        if not user:
-            await event.respond("You don't have an FTP account yet. Use /create first.")
-            return
-        await event.respond(format_account_details(user["username"]))
-
-    @client.on(events.NewMessage(pattern=r"^/filename$"))
-    async def cmd_filename(event):
-        user = get_user_by_chat_id(event.chat_id)
-        if not user:
-            await event.respond("Use /create first.")
-            return
-        new_val = 0 if user["setting_send_file_name"] else 1
-        with get_db() as conn:
-            conn.execute(
-                "UPDATE users SET setting_send_file_name = ? WHERE id = ?",
-                (new_val, user["id"]),
-            )
-            conn.commit()
-        await event.respond(f"Send filename as caption: **{'ON' if new_val else 'OFF'}**")
-
-    @client.on(events.NewMessage(pattern=r"^/(stop|resume)$"))
-    async def cmd_stop_resume(event):
-        user = get_user_by_chat_id(event.chat_id)
-        if not user:
-            await event.respond("Use /create first.")
-            return
-        stopped = 1 if event.pattern_match.group(1) == "stop" else 0
-        with get_db() as conn:
-            conn.execute(
-                "UPDATE users SET is_stopped = ? WHERE id = ?", (stopped, user["id"])
-            )
-            conn.commit()
-        await event.respond("FTP uploads **paused**." if stopped else "FTP uploads **resumed**.")
-
-    @client.on(events.NewMessage(pattern=r"^/status$"))
-    async def cmd_status(event):
-        user = get_user_by_chat_id(event.chat_id)
-        if not user:
-            await event.respond("Use /create first.")
-            return
-        target_chat = user["tg_migrated_chat_id"] or user["tg_chat_id"]
-        with get_db() as conn:
-            pending = conn.execute(
-                "SELECT COUNT(*) FROM file_send_schedule WHERE tg_chat_id = ? AND time_sent IS NULL AND COALESCE(failed, 0) = 0",
-                (target_chat,),
-            ).fetchone()[0]
-        await event.respond(
-            f"**Status**\n"
-            f"Username: `{user['username']}`\n"
-            f"Active: {'No (Paused)' if user['is_stopped'] else 'Yes'}\n"
-            f"Send filename caption: {'ON' if user['setting_send_file_name'] else 'OFF'}\n"
-            f"Queued files: `{pending}`"
-        )
-
-async def start_telethon():
-    global wake_event
-    wake_event = asyncio.Event()
-
-    client = TelegramClient(str(SESSION_PATH), API_ID, API_HASH)
-    await client.start(bot_token=BOT_TOKEN)
-    register_bot_commands(client)
-
-    logging.info("[Telegram] Connected via MTProto (2 GB upload limit active).")
-    workers = [
-        asyncio.create_task(worker_loop(i + 1, client))
-        for i in range(CONCURRENT_UPLOADS)
-    ]
-    tg_ready.set()
-    trigger_workers()  # Pick up any unsent rows from previous runs
-    await asyncio.gather(*workers, client.run_until_disconnected())
-
-
-def run_telethon_thread():
-    asyncio.set_event_loop(tg_loop)
-    tg_loop.run_until_complete(start_telethon())
-
-
-def main():
-    init_db()
-
-    t = threading.Thread(target=run_telethon_thread, daemon=True)
-    t.start()
-    tg_ready.wait()
-
-    handler = MultiUserTelegramFTPHandler
-    handler.authorizer = SQLiteAuthorizer()
-    handler.masquerade_address = PUBLIC_IP
-    handler.passive_ports = range(PASSIVE_PORT_START, PASSIVE_PORT_END + 1)
-
-    server = FTPServer(("0.0.0.0", FTP_PORT), handler)
-    server.max_cons = 100
-    server.max_cons_per_ip = 10
-    logging.info("[FTP] Multi-user server listening on %s:%d", PUBLIC_IP, FTP_PORT)
+    display_ip = PUBLIC_IP or FTP_HOST
+    logger.info("[FTP] Multi-user server listening on %s:%s", display_ip, FTP_PORT)
     server.serve_forever()
 
 
-if __name__ == "__main__":
-    main()
+# ---------------------------------------------------------------------------
+# Telegram Auto-Migration & Lookup Helpers
+# ---------------------------------------------------------------------------
+async def get_user_for_chat(client: TelegramClient, chat_id: int):
+    """Find user by tg_chat_id or tg_migrated_chat_id; auto-link supergroups."""
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT * FROM users WHERE tg_chat_id = ? OR tg_migrated_chat_id = ?",
+            (chat_id, chat_id),
+        ).fetchone()
+        if row:
+            return row
 
+    if str(chat_id).startswith("-100"):
+        try:
+            full = await client(GetFullChannelRequest(chat_id))
+            old_raw_id = getattr(full.full_chat, "migrated_from_chat_id", None)
+            if old_raw_id:
+                old_chat_id = utils.get_peer_id(PeerChat(old_raw_id))
+                with get_db() as conn:
+                    row = conn.execute(
+                        "SELECT * FROM users WHERE tg_chat_id = ?",
+                        (old_chat_id,),
+                    ).fetchone()
+                    if row:
+                        conn.execute(
+                            "UPDATE users SET tg_migrated_chat_id = ? WHERE tg_chat_id = ?",
+                            (chat_id, old_chat_id),
+                        )
+                        conn.execute(
+                            "UPDATE file_send_schedule SET tg_chat_id = ? WHERE tg_chat_id = ?",
+                            (chat_id, old_chat_id),
+                        )
+                        conn.commit()
+                        logger.info("[Migration] Auto-linked %s -> %s", old_chat_id, chat_id)
+                        return conn.execute(
+                            "SELECT * FROM users WHERE tg_migrated_chat_id = ?",
+                            (chat_id,),
+                        ).fetchone()
+        except Exception as e:
+            logger.warning("[Migration] Could not inspect supergroup %s: %s", chat_id, e)
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Telegram Upload Worker
+# ---------------------------------------------------------------------------
+async def upload_worker(client: TelegramClient) -> None:
+    """Continuously sends queued FTP files to Telegram via MTProto."""
+    while True:
+        try:
+            with get_db() as conn:
+                rows = conn.execute(
+                    "SELECT * FROM file_send_schedule ORDER BY id ASC LIMIT 10"
+                ).fetchall()
+
+            if not rows:
+                await asyncio.sleep(1.5)
+                continue
+
+            for row in rows:
+                row_id = row["id"]
+                target_chat = row["tg_chat_id"]
+                file_path = Path(row["file_path"])
+                filename = row["filename"]
+                caption = filename if row["send_filename"] else ""
+
+                if not file_path.exists():
+                    with get_db() as conn:
+                        conn.execute("DELETE FROM file_send_schedule WHERE id = ?", (row_id,))
+                        conn.commit()
+                    continue
+
+                try:
+                    await client.send_file(
+                        target_chat,
+                        file=str(file_path),
+                        caption=caption,
+                    )
+                    file_path.unlink(missing_ok=True)
+                    with get_db() as conn:
+                        conn.execute("DELETE FROM file_send_schedule WHERE id = ?", (row_id,))
+                        conn.commit()
+                    logger.info("[Telegram] Sent '%s' -> chat %s", filename, target_chat)
+
+                except FloodWaitError as e:
+                    logger.warning("[Telegram] FloodWait: sleeping %ss", e.seconds)
+                    await asyncio.sleep(e.seconds + 1)
+
+                except ChatWriteForbiddenError:
+                    entity = await client.get_entity(target_chat)
+                    migrated_to = getattr(entity, "migrated_to", None)
+                    if migrated_to:
+                        new_chat_id = utils.get_peer_id(migrated_to)
+                        with get_db() as conn:
+                            conn.execute(
+                                "UPDATE users SET tg_migrated_chat_id = ? WHERE tg_chat_id = ?",
+                                (new_chat_id, target_chat),
+                            )
+                            conn.execute(
+                                "UPDATE file_send_schedule SET tg_chat_id = ? WHERE tg_chat_id = ?",
+                                (new_chat_id, target_chat),
+                            )
+                            conn.commit()
+                        logger.info("[Migration] Updated target %s -> %s", target_chat, new_chat_id)
+                        continue
+                    logger.error("[Telegram] No write permission in chat %s", target_chat)
+                    await asyncio.sleep(5)
+
+                except Exception as e:
+                    logger.error("[Telegram] Failed sending '%s' to %s: %s", filename, target_chat, e)
+                    await asyncio.sleep(5)
+
+        except Exception as e:
+            logger.error("[Worker] Unexpected loop error: %s", e)
+            await asyncio.sleep(3)
+
+
+# ---------------------------------------------------------------------------
+# Telegram Bot Command Handlers
+# ---------------------------------------------------------------------------
+def register_bot_commands(client: TelegramClient, bot_username: str | None = None) -> None:
+    bot_tag = rf"(?:@{re.escape(bot_username)})?" if bot_username else ""
+
+    @client.on(events.NewMessage())
+    async def on_group_migrated(event):
+        action = getattr(event.message, "action", None)
+        if isinstance(action, MessageActionChannelMigrateFrom):
+            old_chat_id = utils.get_peer_id(PeerChat(action.chat_id))
+            new_chat_id = event.chat_id
+            with get_db() as conn:
+                conn.execute(
+                    "UPDATE users SET tg_migrated_chat_id = ? WHERE tg_chat_id = ?",
+                    (new_chat_id, old_chat_id),
+                )
+                conn.execute(
+                    "UPDATE file_send_schedule SET tg_chat_id = ? WHERE tg_chat_id = ?",
+                    (new_chat_id, old_chat_id),
+                )
+                conn.commit()
+            logger.info("[Migration] Real-time link %s -> %s", old_chat_id, new_chat_id)
+
+    @client.on(events.NewMessage(pattern=rf"(?i)^/start{bot_tag}$"))
+    async def cmd_start(event):
+        await event.reply(
+            "**FTP to Telegram Bot**\n\n"
+            "Commands:\n"
+            "• `/create <username> <password>` — Create an FTP account for this chat\n"
+            "• `/account` — Show your FTP connection details\n"
+            "• `/password <new_password>` — Change your FTP password\n"
+            "• `/filename` — Toggle filename captions on/off\n"
+            "• `/stop` / `/resume` — Pause or resume forwarding\n"
+            "• `/status` — Show account & queue status"
+        )
+
+    @client.on(events.NewMessage(pattern=rf"(?i)^/create{bot_tag}(?:\s+(\S+)\s+(\S+))?$"))
+    async def cmd_create(event):
+        existing = await get_user_for_chat(client, event.chat_id)
+        if existing:
+            await event.reply(
+                f"This chat already has an FTP account (`{existing['username']}`). "
+                "Use `/account` to view it or `/password <new_password>` to change the password."
+            )
+            return
+
+        username = event.pattern_match.group(1)
+        password = event.pattern_match.group(2)
+        if not username or not password:
+            await event.reply("Usage: `/create <username> <password>`")
+            return
+
+        try:
+            with get_db() as conn:
+                conn.execute(
+                    "INSERT INTO users (tg_chat_id, username, password) VALUES (?, ?, ?)",
+                    (event.chat_id, username, password),
+                )
+                conn.commit()
+            safe_user_dir(username)
+        except sqlite3.IntegrityError:
+            await event.reply(f"Username `{username}` is already taken. Choose another.")
+            return
+
+        host = PUBLIC_IP or FTP_HOST
+        await event.reply(
+            f"FTP account created:\n"
+            f"• **Host:** `{host}`\n"
+            f"• **Port:** `{FTP_PORT}`\n"
+            f"• **Username:** `{username}`\n"
+            f"• **Password:** `{password}`\n"
+            f"• **Mode:** Passive (PASV)"
+        )
+
+    @client.on(events.NewMessage(pattern=rf"(?i)^/account{bot_tag}$"))
+    async def cmd_account(event):
+        user = await get_user_for_chat(client, event.chat_id)
+        if not user:
+            await event.reply("No FTP account found for this chat. Use `/create <username> <password>`.")
+            return
+
+        host = PUBLIC_IP or FTP_HOST
+        await event.reply(
+            f"**FTP Account Details**\n"
+            f"• **Host:** `{host}`\n"
+            f"• **Port:** `{FTP_PORT}`\n"
+            f"• **Username:** `{user['username']}`\n"
+            f"• **Password:** `{user['password']}`\n"
+            f"• **Filename caption:** `{'ON' if user['send_filename'] else 'OFF'}`\n"
+            f"• **Delivery:** `{'PAUSED' if user['stopped'] else 'ACTIVE'}`"
+        )
+
+    @client.on(events.NewMessage(pattern=rf"(?i)^/password{bot_tag}(?:\s+(\S+))?$"))
+    async def cmd_password(event):
+        user = await get_user_for_chat(client, event.chat_id)
+        if not user:
+            await event.reply("No FTP account found for this chat.")
+            return
+
+        new_pw = event.pattern_match.group(1)
+        if not new_pw:
+            await event.reply("Usage: `/password <new_password>`")
+            return
+
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE users SET password = ? WHERE id = ?",
+                (new_pw, user["id"]),
+            )
+            conn.commit()
+        await event.reply(f"Password updated for `{user['username']}`.")
+
+    @client.on(events.NewMessage(pattern=rf"(?i)^/filename{bot_tag}$"))
+    async def cmd_filename(event):
+        user = await get_user_for_chat(client, event.chat_id)
+        if not user:
+            await event.reply("No FTP account found for this chat.")
+            return
+
+        new_val = 0 if user["send_filename"] else 1
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE users SET send_filename = ? WHERE id = ?",
+                (new_val, user["id"]),
+            )
+            conn.commit()
+        await event.reply(f"Filename captions are now **{'ON' if new_val else 'OFF'}**.")
+
+    @client.on(events.NewMessage(pattern=rf"(?i)^/(stop|resume){bot_tag}$"))
+    async def cmd_stop_resume(event):
+        user = await get_user_for_chat(client, event.chat_id)
+        if not user:
+            await event.reply("No FTP account found for this chat.")
+            return
+
+        action = event.pattern_match.group(1).lower()
+        stopped = 1 if action == "stop" else 0
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE users SET stopped = ? WHERE id = ?",
+                (stopped, user["id"]),
+            )
+            conn.commit()
+        await event.reply("FTP forwarding **paused**." if stopped else "FTP forwarding **resumed**.")
+
+    @client.on(events.NewMessage(pattern=rf"(?i)^/status{bot_tag}$"))
+    async def cmd_status(event):
+        user = await get_user_for_chat(client, event.chat_id)
+        if not user:
+            await event.reply("No FTP account found for this chat.")
+            return
+
+        target_chat = user["tg_migrated_chat_id"] or user["tg_chat_id"]
+        with get_db() as conn:
+            queued = conn.execute(
+                "SELECT COUNT(*) FROM file_send_schedule WHERE tg_chat_id = ?",
+                (target_chat,),
+            ).fetchone()[0]
+
+        await event.reply(
+            f"**Status for `{user['username']}`**\n"
+            f"• **Delivery:** `{'PAUSED' if user['stopped'] else 'ACTIVE'}`\n"
+            f"• **Queued files:** `{queued}`"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Entrypoint
+# ---------------------------------------------------------------------------
+async def main() -> None:
+    if not (API_ID and API_HASH and BOT_TOKEN):
+        raise RuntimeError("Missing API_ID, API_HASH, or BOT_TOKEN in .env")
+
+    init_db()
+
+    client = TelegramClient(SESSION_PATH, API_ID, API_HASH)
+    await client.start(bot_token=BOT_TOKEN)
+    me = await client.get_me()
+    logger.info("[Telegram] Connected via MTProto as @%s (2 GB upload limit active).", me.username)
+
+    register_bot_commands(client, me.username)
+
+    ftp_thread = threading.Thread(target=start_ftp_server, daemon=True)
+    ftp_thread.start()
+
+    worker_task = asyncio.create_task(upload_worker(client))
+    try:
+        await client.run_until_disconnected()
+    finally:
+        worker_task.cancel()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
