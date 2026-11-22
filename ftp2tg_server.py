@@ -2,9 +2,12 @@
 """Virtual Multi-User FTP to Telegram Server (MTProto / 2 GB limit)."""
 
 import asyncio
+import hashlib
+import hmac
 import logging
 import os
 import re
+import secrets
 import sqlite3
 import threading
 from pathlib import Path
@@ -135,6 +138,54 @@ def safe_user_dir(username: str) -> Path:
 
 
 # ---------------------------------------------------------------------------
+# Password Hashing (scrypt + Legacy MD5 Auto-Upgrade)
+# ---------------------------------------------------------------------------
+def hash_password(password: str) -> str:
+    """Hash a password with a random 16-byte salt using scrypt."""
+    salt = secrets.token_bytes(16)
+    dk = hashlib.scrypt(
+        password.encode("utf-8"),
+        salt=salt,
+        n=2**14,
+        r=8,
+        p=1,
+        dklen=32,
+    )
+    return f"scrypt${salt.hex()}${dk.hex()}"
+
+
+def verify_password(password: str, stored: str) -> tuple[bool, bool]:
+    """Return (is_valid, needs_upgrade). Supports scrypt and legacy MD5."""
+    if not stored:
+        return False, False
+
+    if stored.startswith("scrypt$"):
+        try:
+            _, salt_hex, hash_hex = stored.split("$", 2)
+            salt = bytes.fromhex(salt_hex)
+            expected = bytes.fromhex(hash_hex)
+            actual = hashlib.scrypt(
+                password.encode("utf-8"),
+                salt=salt,
+                n=2**14,
+                r=8,
+                p=1,
+                dklen=len(expected),
+            )
+            return hmac.compare_digest(actual, expected), False
+        except (ValueError, TypeError):
+            return False, False
+
+    # Legacy 32-char hex MD5 hash
+    if len(stored) == 32 and all(c in "0123456789abcdefABCDEF" for c in stored):
+        legacy_md5 = hashlib.md5(password.encode("utf-8")).hexdigest()
+        if hmac.compare_digest(legacy_md5, stored.lower()):
+            return True, True  # Valid; upgrade to scrypt
+
+    return False, False
+
+
+# ---------------------------------------------------------------------------
 # FTP Server (pyftpdlib)
 # ---------------------------------------------------------------------------
 class SQLiteAuthorizer(DummyAuthorizer):
@@ -151,13 +202,25 @@ class SQLiteAuthorizer(DummyAuthorizer):
                 (username,),
             ).fetchone()
 
-        if not user or user["password"] != password:
-            raise AuthenticationFailed("Invalid username or password.")
+            if not user:
+                raise AuthenticationFailed("Invalid username or password.")
+
+            valid, needs_upgrade = verify_password(password, user["password"])
+            if not valid:
+                raise AuthenticationFailed("Invalid username or password.")
+
+            if needs_upgrade:
+                conn.execute(
+                    "UPDATE users SET password = ? WHERE id = ?",
+                    (hash_password(password), user["id"]),
+                )
+                conn.commit()
+                logger.info("[Auth] Upgraded legacy MD5 password to scrypt for '%s'", username)
 
         home_dir = str(safe_user_dir(username))
         with self._lock:
             self.user_table[username] = {
-                "pwd": password,
+                "pwd": "",
                 "home": home_dir,
                 "perm": "elradfmwMT",
                 "operms": {},
@@ -403,11 +466,12 @@ def register_bot_commands(client: TelegramClient, bot_username: str | None = Non
             await event.reply("Usage: `/create <username> <password>`")
             return
 
+        password_hash = hash_password(password)
         try:
             with get_db() as conn:
                 conn.execute(
                     "INSERT INTO users (tg_chat_id, username, password) VALUES (?, ?, ?)",
-                    (event.chat_id, username, password),
+                    (event.chat_id, username, password_hash),
                 )
                 conn.commit()
             safe_user_dir(username)
@@ -421,7 +485,7 @@ def register_bot_commands(client: TelegramClient, bot_username: str | None = Non
             f"• **Host:** `{host}`\n"
             f"• **Port:** `{FTP_PORT}`\n"
             f"• **Username:** `{username}`\n"
-            f"• **Password:** `{password}`\n"
+            f"• **Password:** *(saved securely as hash)*\n"
             f"• **Mode:** Passive (PASV)"
         )
 
@@ -438,7 +502,7 @@ def register_bot_commands(client: TelegramClient, bot_username: str | None = Non
             f"• **Host:** `{host}`\n"
             f"• **Port:** `{FTP_PORT}`\n"
             f"• **Username:** `{user['username']}`\n"
-            f"• **Password:** `{user['password']}`\n"
+            f"• **Password:** *(hidden — use `/password <new_password>` to reset)*\n"
             f"• **Filename caption:** `{'ON' if user['send_filename'] else 'OFF'}`\n"
             f"• **Delivery:** `{'PAUSED' if user['stopped'] else 'ACTIVE'}`"
         )
@@ -458,7 +522,7 @@ def register_bot_commands(client: TelegramClient, bot_username: str | None = Non
         with get_db() as conn:
             conn.execute(
                 "UPDATE users SET password = ? WHERE id = ?",
-                (new_pw, user["id"]),
+                (hash_password(new_pw), user["id"]),
             )
             conn.commit()
         await event.reply(f"Password updated for `{user['username']}`.")
