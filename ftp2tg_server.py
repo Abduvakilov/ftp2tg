@@ -4,12 +4,15 @@
 import asyncio
 import hashlib
 import hmac
+import json
 import logging
 import os
 import re
 import secrets
 import sqlite3
+import subprocess
 import threading
+import time
 from pathlib import Path
 
 from pyftpdlib.authorizers import AuthenticationFailed, DummyAuthorizer
@@ -18,7 +21,11 @@ from pyftpdlib.servers import FTPServer
 from telethon import TelegramClient, events, utils
 from telethon.errors import ChatWriteForbiddenError, FloodWaitError
 from telethon.tl.functions.channels import GetFullChannelRequest
-from telethon.tl.types import MessageActionChannelMigrateFrom, PeerChat
+from telethon.tl.types import (
+    DocumentAttributeVideo,
+    MessageActionChannelMigrateFrom,
+    PeerChat,
+)
 
 # ---------------------------------------------------------------------------
 # Logging & Environment Setup
@@ -73,6 +80,13 @@ PASSIVE_END = int(env_any("PASSIVE_PORT_END", default="60050"))
 
 SPOOL_DIR.mkdir(parents=True, exist_ok=True)
 
+# Rate limiting & media settings
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
+VIDEO_EXTS = {".mp4", ".mov", ".m4v"}
+GROUP_INTERVAL = 3.1   # Safe pace under Telegram's 20 msg/min per-group limit
+DM_INTERVAL = 1.1      # Safe pace under Telegram's 1 msg/sec per-DM limit
+MAX_ALBUM_SIZE = 10    # Telegram photo album limit
+
 
 # ---------------------------------------------------------------------------
 # SQLite Database (WAL Mode)
@@ -95,7 +109,7 @@ def init_db() -> None:
                 tg_migrated_chat_id INTEGER,
                 username TEXT UNIQUE NOT NULL,
                 password TEXT NOT NULL,
-                send_filename INTEGER DEFAULT 1,
+                send_filename INTEGER DEFAULT 0,
                 stopped INTEGER DEFAULT 0
             )
             """
@@ -107,12 +121,11 @@ def init_db() -> None:
                 tg_chat_id INTEGER NOT NULL,
                 file_path TEXT NOT NULL,
                 filename TEXT NOT NULL,
-                send_filename INTEGER DEFAULT 1,
+                send_filename INTEGER DEFAULT 0,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
             """
         )
-        # Ensure optional columns exist on older databases
         cols = {
             row["name"]
             for row in conn.execute("PRAGMA table_info(users)").fetchall()
@@ -120,7 +133,7 @@ def init_db() -> None:
         if "tg_migrated_chat_id" not in cols:
             conn.execute("ALTER TABLE users ADD COLUMN tg_migrated_chat_id INTEGER")
         if "send_filename" not in cols:
-            conn.execute("ALTER TABLE users ADD COLUMN send_filename INTEGER DEFAULT 1")
+            conn.execute("ALTER TABLE users ADD COLUMN send_filename INTEGER DEFAULT 0")
         if "stopped" not in cols:
             conn.execute("ALTER TABLE users ADD COLUMN stopped INTEGER DEFAULT 0")
         conn.commit()
@@ -180,9 +193,77 @@ def verify_password(password: str, stored: str) -> tuple[bool, bool]:
     if len(stored) == 32 and all(c in "0123456789abcdefABCDEF" for c in stored):
         legacy_md5 = hashlib.md5(password.encode("utf-8")).hexdigest()
         if hmac.compare_digest(legacy_md5, stored.lower()):
-            return True, True  # Valid; upgrade to scrypt
+            return True, True  # Valid; flag for transparent upgrade to scrypt
 
     return False, False
+
+
+# ---------------------------------------------------------------------------
+# Video Metadata & Thumbnail Helper
+# ---------------------------------------------------------------------------
+def prepare_video_media(file_path: Path) -> tuple[list | None, Path | None]:
+    """Extract width, height, duration, and a <=320px JPEG thumbnail for Telegram."""
+    width = height = duration = 0
+    try:
+        probe = subprocess.run(
+            [
+                "ffprobe",
+                "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=width,height,duration:format=duration",
+                "-of", "json",
+                str(file_path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=True,
+        )
+        info = json.loads(probe.stdout)
+        streams = info.get("streams") or []
+        if streams:
+            width = int(streams[0].get("width") or 0)
+            height = int(streams[0].get("height") or 0)
+            raw_dur = (
+                streams[0].get("duration")
+                or info.get("format", {}).get("duration")
+                or 0
+            )
+            duration = int(float(raw_dur)) if raw_dur != "N/A" else 0
+    except Exception as e:
+        logger.warning("[Video] ffprobe failed for '%s': %s", file_path.name, e)
+
+    thumb_path = file_path.with_suffix(file_path.suffix + ".thumb.jpg")
+    scale_filter = "scale='min(320,iw)':'min(320,ih)':force_original_aspect_ratio=decrease"
+    for seek_args in (["-ss", "00:00:01"], []):
+        try:
+            subprocess.run(
+                [
+                    "ffmpeg",
+                    "-y",
+                    *seek_args,
+                    "-i", str(file_path),
+                    "-vframes", "1",
+                    "-vf", scale_filter,
+                    "-q:v", "5",
+                    str(thumb_path),
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=15,
+                check=True,
+            )
+            if thumb_path.is_file() and thumb_path.stat().st_size > 0:
+                break
+        except Exception:
+            thumb_path.unlink(missing_ok=True)
+
+    attributes = (
+        [DocumentAttributeVideo(duration=duration, w=width, h=height, supports_streaming=True)]
+        if width > 0 and height > 0
+        else None
+    )
+    return attributes, (thumb_path if thumb_path.is_file() else None)
 
 
 # ---------------------------------------------------------------------------
@@ -340,49 +421,125 @@ async def get_user_for_chat(client: TelegramClient, chat_id: int):
 
 
 # ---------------------------------------------------------------------------
-# Telegram Upload Worker
+# Telegram High-Throughput Upload Worker
 # ---------------------------------------------------------------------------
 async def upload_worker(client: TelegramClient) -> None:
-    """Continuously sends queued FTP files to Telegram via MTProto."""
+    """Per-chat rate-limited worker with photo album batching and video metadata."""
+    next_allowed: dict[int, float] = {}
+
     while True:
         try:
             with get_db() as conn:
                 rows = conn.execute(
-                    "SELECT * FROM file_send_schedule ORDER BY id ASC LIMIT 10"
+                    "SELECT * FROM file_send_schedule ORDER BY id ASC LIMIT 200"
                 ).fetchall()
 
             if not rows:
-                await asyncio.sleep(1.5)
+                await asyncio.sleep(1.0)
                 continue
 
-            for row in rows:
-                row_id = row["id"]
-                target_chat = row["tg_chat_id"]
-                file_path = Path(row["file_path"])
-                filename = row["filename"]
-                caption = filename if row["send_filename"] else ""
+            now = time.monotonic()
 
-                if not file_path.exists():
-                    with get_db() as conn:
-                        conn.execute("DELETE FROM file_send_schedule WHERE id = ?", (row_id,))
-                        conn.commit()
+            by_chat: dict[int, list[sqlite3.Row]] = {}
+            for row in rows:
+                by_chat.setdefault(row["tg_chat_id"], []).append(row)
+
+            sent_any = False
+
+            for target_chat, chat_rows in by_chat.items():
+                if now < next_allowed.get(target_chat, 0.0):
                     continue
 
-                try:
-                    await client.send_file(
-                        target_chat,
-                        file=str(file_path),
-                        caption=caption,
-                    )
-                    file_path.unlink(missing_ok=True)
+                valid_rows = []
+                missing_ids = []
+                for r in chat_rows:
+                    if Path(r["file_path"]).exists():
+                        valid_rows.append(r)
+                    else:
+                        missing_ids.append(r["id"])
+
+                if missing_ids:
                     with get_db() as conn:
-                        conn.execute("DELETE FROM file_send_schedule WHERE id = ?", (row_id,))
+                        conn.executemany(
+                            "DELETE FROM file_send_schedule WHERE id = ?",
+                            [(mid,) for mid in missing_ids],
+                        )
                         conn.commit()
-                    logger.info("[Telegram] Sent '%s' -> chat %s", filename, target_chat)
+
+                if not valid_rows:
+                    continue
+
+                # Batch consecutive photos into albums; send videos and other files individually
+                first_ext = Path(valid_rows[0]["file_path"]).suffix.lower()
+                if first_ext in IMAGE_EXTS:
+                    batch = []
+                    for r in valid_rows:
+                        if Path(r["file_path"]).suffix.lower() in IMAGE_EXTS:
+                            batch.append(r)
+                            if len(batch) == MAX_ALBUM_SIZE:
+                                break
+                        else:
+                            break
+                else:
+                    batch = [valid_rows[0]]
+
+                files = [r["file_path"] for r in batch]
+                captions = [r["filename"] if r["send_filename"] else "" for r in batch]
+                thumb_path: Path | None = None
+
+                try:
+                    if len(batch) == 1:
+                        file_path = Path(files[0])
+                        caption = captions[0] or None
+                        if file_path.suffix.lower() in VIDEO_EXTS:
+                            attributes, thumb_path = await asyncio.to_thread(
+                                prepare_video_media, file_path
+                            )
+                            await client.send_file(
+                                target_chat,
+                                file=str(file_path),
+                                caption=caption,
+                                attributes=attributes,
+                                thumb=str(thumb_path) if thumb_path else None,
+                                supports_streaming=bool(attributes),
+                            )
+                        else:
+                            await client.send_file(
+                                target_chat,
+                                file=str(file_path),
+                                caption=caption,
+                            )
+                    else:
+                        await client.send_file(
+                            target_chat,
+                            file=files,
+                            caption=captions if any(captions) else None,
+                        )
+
+                    for r in batch:
+                        Path(r["file_path"]).unlink(missing_ok=True)
+
+                    with get_db() as conn:
+                        conn.executemany(
+                            "DELETE FROM file_send_schedule WHERE id = ?",
+                            [(r["id"],) for r in batch],
+                        )
+                        conn.commit()
+
+                    interval = GROUP_INTERVAL if target_chat < 0 else DM_INTERVAL
+                    next_allowed[target_chat] = time.monotonic() + (interval * len(batch))
+                    sent_any = True
+                    logger.info(
+                        "[Telegram] Sent %d file(s) -> chat %s", len(batch), target_chat
+                    )
 
                 except FloodWaitError as e:
-                    logger.warning("[Telegram] FloodWait: sleeping %ss", e.seconds)
-                    await asyncio.sleep(e.seconds + 1)
+                    next_allowed[target_chat] = time.monotonic() + e.seconds + 1
+                    logger.warning(
+                        "[Telegram] FloodWait for chat %s: cooling down %ss",
+                        target_chat,
+                        e.seconds,
+                    )
 
                 except ChatWriteForbiddenError:
                     entity = await client.get_entity(target_chat)
@@ -400,13 +557,20 @@ async def upload_worker(client: TelegramClient) -> None:
                             )
                             conn.commit()
                         logger.info("[Migration] Updated target %s -> %s", target_chat, new_chat_id)
-                        continue
-                    logger.error("[Telegram] No write permission in chat %s", target_chat)
-                    await asyncio.sleep(5)
+                    else:
+                        next_allowed[target_chat] = time.monotonic() + 60
+                        logger.error("[Telegram] No write permission in chat %s", target_chat)
 
                 except Exception as e:
-                    logger.error("[Telegram] Failed sending '%s' to %s: %s", filename, target_chat, e)
-                    await asyncio.sleep(5)
+                    next_allowed[target_chat] = time.monotonic() + 10
+                    logger.error("[Telegram] Failed sending to %s: %s", target_chat, e)
+
+                finally:
+                    if thumb_path:
+                        thumb_path.unlink(missing_ok=True)
+
+            if not sent_any:
+                await asyncio.sleep(0.5)
 
         except Exception as e:
             logger.error("[Worker] Unexpected loop error: %s", e)
@@ -470,7 +634,7 @@ def register_bot_commands(client: TelegramClient, bot_username: str | None = Non
         try:
             with get_db() as conn:
                 conn.execute(
-                    "INSERT INTO users (tg_chat_id, username, password) VALUES (?, ?, ?)",
+                    "INSERT INTO users (tg_chat_id, username, password, send_filename) VALUES (?, ?, ?, 0)",
                     (event.chat_id, username, password_hash),
                 )
                 conn.commit()
@@ -590,8 +754,15 @@ async def main() -> None:
 
     init_db()
 
+    try:
+        import static_ffmpeg
+        static_ffmpeg.add_paths(weak=True)
+    except ImportError:
+        pass
+
     client = TelegramClient(SESSION_PATH, API_ID, API_HASH)
     await client.start(bot_token=BOT_TOKEN)
+    client.flood_sleep_threshold = 0
     me = await client.get_me()
     logger.info("[Telegram] Connected via MTProto as @%s (2 GB upload limit active).", me.username)
 
